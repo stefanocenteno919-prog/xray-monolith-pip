@@ -6,6 +6,7 @@
 #include "script_game_object.h"
 #include "script_game_object_impl.h"
 #include "InventoryOwner.h"
+#include "InventoryContainer.h"	// AMP: needed by IterateInventory as well now
 #include "Pda.h"
 #include "xrMessages.h"
 #include "character_info.h"
@@ -268,6 +269,39 @@ void CScriptGameObject::IterateInventory(::luabind::functor<bool> functor, ::lua
 	for (; I != E; ++I)
 		if (functor(object, (*I)->object().lua_game_object()) == true)
 			return;
+
+	// ============================================================
+	// AMP: ...AND WHAT IS INSIDE THE CASES
+	//
+	// The same blind spot as CInventory::Get, on the other door. Every
+	// script that counts what the player has walks this, so a task that
+	// wants five bandages counts none of the five in a med case.
+	//
+	// AFTER the loose items, so anything that stops early sees the
+	// ordinary inventory first and in the order it always did.
+	//
+	// OVER A COPY of each id list, for the reason IterateContainer
+	// gives: the functor is script and may take things out mid-walk.
+	//
+	// ONE LEVEL. A container never holds another container.
+	// ============================================================
+	TIItemContainer boxes = inventory_owner->inventory().m_all;
+	for (TIItemContainer::iterator bi = boxes.begin(); boxes.end() != bi; ++bi)
+	{
+		CInventoryContainer* box = smart_cast<CInventoryContainer*>(*bi);
+		if (!box)
+			continue;
+
+		xr_vector<u16> items = box->m_items;
+		for (xr_vector<u16>::const_iterator ci = items.begin();
+		     items.end() != ci; ++ci)
+		{
+			CGameObject* GO = smart_cast<CGameObject*>(Level().Objects.net_Find(*ci));
+			if (GO)
+				if (functor(object, GO->lua_game_object()) == true)
+					return;
+		}
+	}
 }
 
 void CScriptGameObject::IterateRuck(::luabind::functor<bool> functor, ::luabind::object object)
@@ -323,6 +357,36 @@ void CScriptGameObject::IterateInventoryBox(::luabind::functor<bool> functor, ::
 			if (functor(object, GO->lua_game_object()) == true)
 				return;
 	}
+}
+
+// AMP: the carryable container's mirror of IterateInventoryBox.
+void CScriptGameObject::IterateContainer(::luabind::functor<bool> functor, ::luabind::object object)
+{
+	CInventoryContainer* container = smart_cast<CInventoryContainer*>(&this->object());
+	if (!container)
+	{
+		ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError,
+		                                "CScriptGameObject::IterateContainer non-CInventoryContainer object !!!");
+		return;
+	}
+
+	// Over a COPY: the functor is script and may take things out of
+	// the container mid-walk, which edits m_items under the iterator.
+	xr_vector<u16> items = container->m_items;
+	xr_vector<u16>::const_iterator I = items.begin();
+	xr_vector<u16>::const_iterator E = items.end();
+	for (; I != E; ++I)
+	{
+		CGameObject* GO = smart_cast<CGameObject*>(Level().Objects.net_Find(*I));
+		if (GO)
+			if (functor(object, GO->lua_game_object()))
+				return;
+	}
+}
+
+bool CScriptGameObject::IsContainer()
+{
+	return smart_cast<CInventoryContainer*>(&this->object()) != NULL;
 }
 
 void CScriptGameObject::MarkItemDropped(CScriptGameObject* item, bool flag)
@@ -614,9 +678,37 @@ void CScriptGameObject::TransferItem(CScriptGameObject* pItem, CScriptGameObject
 		return;
 	}
 
+	// ============================================================
+	// AMP: SOLD BY WHOEVER ACTUALLY HOLDS IT
+	//
+	// This sent the "sell" from object().ID() - the caller - on the
+	// assumption that the caller owns the item. Since containers, an
+	// item the actor can SEE may be owned by a case he is carrying, and
+	// telling the actor to let go of something he is not holding does
+	// nothing at all: the item stays in the case, the buyer gets
+	// nothing, and a quest hand-in that walked the inventory, found it
+	// and "took" it has in fact taken nothing.
+	//
+	// So the seller is the item's real parent when that parent is one
+	// of our containers. Everything else is exactly as it was - a
+	// normal item's parent IS the caller, and this reads as the same
+	// two events it always sent.
+	//
+	// NOT A GENERAL "sell from whoever holds it". Only a container, and
+	// only because a container is a thing this engine lets you carry
+	// while it owns its contents. A stash, an NPC, a corpse - all
+	// unchanged.
+	// ============================================================
+	u16 seller = object().ID();
+	{
+		CObject* parent = pIItem->object().H_Parent();
+		if (parent && smart_cast<CInventoryContainer*>(parent))
+			seller = u16(parent->ID());
+	}
+
 	// выбросить у себя
 	NET_Packet P;
-	CGameObject::u_EventGen(P, GE_TRADE_SELL, object().ID());
+	CGameObject::u_EventGen(P, GE_TRADE_SELL, seller);
 	P.w_u16(pIItem->object().ID());
 	CGameObject::u_EventSend(P);
 
